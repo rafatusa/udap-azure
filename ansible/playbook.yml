@@ -1,0 +1,95 @@
+---
+- name: Deploy nginx on Azure VM
+  hosts: all
+  become: yes
+
+  vars:
+    app_name: nginx
+    web_root: /var/www/html
+    port: 80
+
+  tasks:
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install nginx"
+      apt:
+        name: nginx
+        state: present
+
+    - name: "Ensure web root directory exists"
+      file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: "Check index.html in repo"
+      stat:
+        path: "{{ playbook_dir }}/../index.html"
+      delegate_to: localhost
+      register: idx
+
+    - name: "Deploy index.html from repo"
+      copy:
+        src: ../index.html
+        dest: "{{ web_root }}/index.html"
+        owner: www-data
+        group: www-data
+        mode: "0644"
+      when: idx.stat.exists
+
+    - name: "Deploy default index.html"
+      copy:
+        content: "<html><body><h1>{{ app_name }}</h1></body></html>"
+        dest: "{{ web_root }}/index.html"
+        owner: www-data
+        group: www-data
+        mode: "0644"
+      when: not idx.stat.exists
+
+    - name: "Configure nginx default site"
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen {{ port }} default_server;
+              listen [::]:{{ port }} default_server;
+
+              root {{ web_root }};
+              index index.html index.htm;
+
+              server_name _;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Enable default nginx site"
+      file:
+        src: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+
+    - name: "Validate nginx configuration"
+      command: nginx -t
+      changed_when: false
+
+    - name: "Enable and start nginx service"
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: "Reload nginx to apply configuration"
+      systemd:
+        name: nginx
+        state: reloaded

@@ -1,0 +1,414 @@
+name: Deploy nginx to Azure VM
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: terraform
+  APP_NAME: nginx
+  APP_PORT: 80
+
+jobs:
+  provision:
+    name: Provision Azure VM with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Write SSH public key
+        run: echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/deploy_key.pub
+
+      - name: Write Terraform backend config
+        run: |
+          mkdir -p ${{ env.TF_WORKING_DIR }}
+          cat > ${{ env.TF_WORKING_DIR }}/backend.tf <<EOF
+          terraform {
+            backend "azurerm" {
+              resource_group_name  = "${{ secrets.TF_STATE_RESOURCE_GROUP }}"
+              storage_account_name = "${{ secrets.TF_STATE_STORAGE_ACCOUNT }}"
+              container_name       = "${{ secrets.TF_STATE_CONTAINER }}"
+              key                  = "${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+            }
+          }
+          EOF
+
+      - name: Write Terraform main config
+        run: |
+          cat > ${{ env.TF_WORKING_DIR }}/main.tf <<'EOF'
+          terraform {
+            required_providers {
+              azurerm = {
+                source  = "hashicorp/azurerm"
+                version = "~> 3.0"
+              }
+            }
+          }
+
+          provider "azurerm" {
+            features {}
+          }
+
+          variable "public_key" {
+            description = "SSH public key content"
+            type        = string
+          }
+
+          variable "location" {
+            description = "Azure region"
+            type        = string
+            default     = "East US"
+          }
+
+          variable "resource_group_name" {
+            description = "Azure Resource Group name"
+            type        = string
+            default     = "udap-azure-rg"
+          }
+
+          variable "vm_size" {
+            description = "Azure VM size"
+            type        = string
+            default     = "Standard_B1s"
+          }
+
+          resource "azurerm_resource_group" "main" {
+            name     = var.resource_group_name
+            location = var.location
+          }
+
+          resource "azurerm_virtual_network" "main" {
+            name                = "udap-azure-vnet"
+            address_space       = ["10.0.0.0/16"]
+            location            = azurerm_resource_group.main.location
+            resource_group_name = azurerm_resource_group.main.name
+          }
+
+          resource "azurerm_subnet" "main" {
+            name                 = "udap-azure-subnet"
+            resource_group_name  = azurerm_resource_group.main.name
+            virtual_network_name = azurerm_virtual_network.main.name
+            address_prefixes     = ["10.0.1.0/24"]
+          }
+
+          resource "azurerm_public_ip" "main" {
+            name                = "udap-azure-pip"
+            location            = azurerm_resource_group.main.location
+            resource_group_name = azurerm_resource_group.main.name
+            allocation_method   = "Static"
+            sku                 = "Standard"
+          }
+
+          resource "azurerm_network_security_group" "main" {
+            name                = "udap-azure-nsg"
+            location            = azurerm_resource_group.main.location
+            resource_group_name = azurerm_resource_group.main.name
+
+            security_rule {
+              name                       = "allow-ssh"
+              priority                   = 1001
+              direction                  = "Inbound"
+              access                     = "Allow"
+              protocol                   = "Tcp"
+              source_port_range          = "*"
+              destination_port_range     = "22"
+              source_address_prefix      = "*"
+              destination_address_prefix = "*"
+            }
+
+            security_rule {
+              name                       = "allow-http"
+              priority                   = 1002
+              direction                  = "Inbound"
+              access                     = "Allow"
+              protocol                   = "Tcp"
+              source_port_range          = "*"
+              destination_port_range     = "80"
+              source_address_prefix      = "*"
+              destination_address_prefix = "*"
+            }
+          }
+
+          resource "azurerm_network_interface" "main" {
+            name                = "udap-azure-nic"
+            location            = azurerm_resource_group.main.location
+            resource_group_name = azurerm_resource_group.main.name
+
+            ip_configuration {
+              name                          = "internal"
+              subnet_id                     = azurerm_subnet.main.id
+              private_ip_address_allocation = "Dynamic"
+              public_ip_address_id          = azurerm_public_ip.main.id
+            }
+          }
+
+          resource "azurerm_network_interface_security_group_association" "main" {
+            network_interface_id      = azurerm_network_interface.main.id
+            network_security_group_id = azurerm_network_security_group.main.id
+          }
+
+          resource "azurerm_linux_virtual_machine" "main" {
+            name                  = "udap-azure-vm"
+            resource_group_name   = azurerm_resource_group.main.name
+            location              = azurerm_resource_group.main.location
+            size                  = var.vm_size
+            admin_username        = "ubuntu"
+            network_interface_ids = [azurerm_network_interface.main.id]
+
+            admin_ssh_key {
+              username   = "ubuntu"
+              public_key = var.public_key
+            }
+
+            os_disk {
+              caching              = "ReadWrite"
+              storage_account_type = "Standard_LRS"
+            }
+
+            source_image_reference {
+              publisher = "Canonical"
+              offer     = "0001-com-ubuntu-server-jammy"
+              sku       = "22_04-lts-gen2"
+              version   = "latest"
+            }
+          }
+
+          output "public_ip" {
+            value = azurerm_public_ip.main.ip_address
+          }
+          EOF
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get server IP
+        id: get_ip
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          SERVER_IP=$(terraform output -raw public_ip)
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "Provisioned VM at: $SERVER_IP"
+
+  configure:
+    name: Configure VM with Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@$SERVER_IP echo ok && break || sleep 10
+          done
+
+      - name: Write Ansible playbook
+        run: |
+          cat > /tmp/playbook.yml <<'EOF'
+          ---
+          - name: Deploy nginx
+            hosts: all
+            become: true
+            vars:
+              app_port: 80
+
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+
+              - name: Install nginx
+                apt:
+                  name: nginx
+                  state: present
+
+              - name: Ensure nginx service is enabled and started
+                systemd:
+                  name: nginx
+                  state: started
+                  enabled: yes
+                  daemon_reload: yes
+
+              - name: Check if custom index file exists
+                stat:
+                  path: /var/www/html/index.html
+                register: index_stat
+
+              - name: Write custom nginx index page
+                copy:
+                  dest: /var/www/html/index.html
+                  content: |
+                    <!DOCTYPE html>
+                    <html>
+                      <head><title>nginx - udap-azure</title></head>
+                      <body>
+                        <h1>nginx deployed successfully</h1>
+                        <p>Project: udap-azure | App: nginx | Port: 80</p>
+                      </body>
+                    </html>
+                  owner: www-data
+                  group: www-data
+                  mode: '0644'
+                when: not index_stat.stat.exists
+
+              - name: Configure nginx default site
+                copy:
+                  dest: /etc/nginx/sites-available/default
+                  content: |
+                    server {
+                        listen 80 default_server;
+                        listen [::]:80 default_server;
+                        root /var/www/html;
+                        index index.html index.htm;
+                        server_name _;
+                        location / {
+                            try_files $uri $uri/ =404;
+                        }
+                    }
+                  owner: root
+                  group: root
+                  mode: '0644'
+                notify: Reload nginx
+
+              - name: Ensure nginx default site is enabled
+                file:
+                  src: /etc/nginx/sites-available/default
+                  dest: /etc/nginx/sites-enabled/default
+                  state: link
+
+            handlers:
+              - name: Reload nginx
+                systemd:
+                  name: nginx
+                  state: reloaded
+          EOF
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          ansible-playbook -i "$SERVER_IP," \
+            --private-key /tmp/deploy_key \
+            -u ubuntu \
+            /tmp/playbook.yml
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+
+    steps:
+      - name: Verify nginx HTTP response
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Verifying nginx at http://$SERVER_IP:80"
+          for i in $(seq 1 10); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://$SERVER_IP:80 || echo "000")
+            echo "Attempt $i: HTTP status $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "nginx is responding correctly with HTTP 200"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "ERROR: nginx did not respond with HTTP 200 after 10 attempts"
+          exit 1
+
+      - name: Verify nginx content
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          RESPONSE=$(curl -s --max-time 10 http://$SERVER_IP:80)
+          echo "Response body: $RESPONSE"
+          if echo "$RESPONSE" | grep -q "nginx"; then
+            echo "nginx content verification passed"
+          else
+            echo "WARNING: Expected nginx content not found in response"
+          fi
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+
+    steps:
+      - name: Deployment success notification
+        if: ${{ needs.verify.result == 'success' }}
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "=========================================="
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+          echo "Project:     udap-azure"
+          echo "App:         nginx"
+          echo "Target:      azure-vm"
+          echo "Region:      East US"
+          echo "Server IP:   $SERVER_IP"
+          echo "URL:         http://$SERVER_IP:80"
+          echo "=========================================="
+
+      - name: Deployment failure notification
+        if: ${{ needs.verify.result != 'success' }}
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "=========================================="
+          echo "DEPLOYMENT FAILED"
+          echo "=========================================="
+          echo "Project:     udap-azure"
+          echo "App:         nginx"
+          echo "Target:      azure-vm"
+          echo "Region:      East US"
+          echo "Server IP:   $SERVER_IP"
+          echo "Please check the workflow logs for details."
+          echo "=========================================="
+          exit 1
